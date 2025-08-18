@@ -4,6 +4,7 @@
 *.potfile
 wpa-benchmark.md
 all
+cross-check
 check
 check.c
 recent
