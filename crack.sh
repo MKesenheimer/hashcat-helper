@@ -9,6 +9,10 @@ function usage() {
     echo "-f|--start-from   start from step x."
     echo "-d|--devices      devices to use (comma separated list)"
     echo "-o|--options      additional options for hashcat"
+    echo
+    echo "Examples:"
+    echo "  ./crack.sh -s 2026-06-11 -d 5,6,7,8 -o \"-w 3\""
+    echo "  ./crack.sh -s 2026-06-11 -r"
     exit 0
 }
  
@@ -66,7 +70,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 set -- "${POSITIONAL[@]}" # restore positional parameters
-echo "${POSITIONAL[@]}" 
+#echo "${POSITIONAL[@]}" 
 
 
 if [[ "$RESTORE" == "true" ]]; then
@@ -75,6 +79,7 @@ if [[ "$RESTORE" == "true" ]]; then
     exit -1
   else
     LAST_SESSION=$(cat session.log)
+    echo "Restoring last session $LAST_SESSION"
   fi
 fi
 
@@ -147,6 +152,14 @@ for step in "${step_order[@]}"; do
         START_FROM="$((stepi+1))"
         RESTORE="false"
     fi
+    echo "$SESSION" >> finished.log    
+
+    # check return value
+    if [[ "$RET_VALUE" == "3" ]]; then
+        echo "Checkoint abort"
+        break
+    fi
+
     echo
 done
 

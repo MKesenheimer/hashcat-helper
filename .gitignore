@@ -8,3 +8,5 @@ cross-check
 check
 check.c
 recent
+CLAUDE.md
+*.log
