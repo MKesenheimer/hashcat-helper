@@ -8,5 +8,7 @@ cross-check
 check
 check.c
 recent
-CLAUDE.md
 *.log
+*.restore
+*.hcmask
+hashcat.*

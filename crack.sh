@@ -13,6 +13,10 @@ function usage() {
     echo "Examples:"
     echo "  ./crack.sh -s 2026-06-11 -d 5,6,7,8 -o \"-w 3\""
     echo "  ./crack.sh -s 2026-06-11 -r"
+    echo
+    echo "Monitoring:"
+    echo "  Monitor status via web UI: python3 status-server.py"
+    echo "  Or CLI: ./poll-status.sh"
     exit 0
 }
  
@@ -143,11 +147,11 @@ for step in "${step_order[@]}"; do
     SESSION="$SESSION_PRE-step$stepi-$wordlist_base$rule_base"
     if [[ "$RESTORE" == "false" ]] && [[ "$START_FROM" == "$stepi" ]]; then
         echo "$SESSION" > session.log
-        hashcat -m $HASH_ID -a 0 -o cracked.txt $rule hashes.hc22000 $wordlist --session "$SESSION" -S -d $DEVICES $OPTIONS
+        hashcat -m $HASH_ID -a 0 -o cracked.txt $rule hashes.hc22000 $wordlist --session "$SESSION" -S -d $DEVICES --status-timer 1 $OPTIONS
         RET_VALUE="$?"
         START_FROM="$((stepi+1))"
     elif [[ "$LAST_SESSION" == "$SESSION" ]]; then
-        hashcat --restore --session "$SESSION" $OPTIONS
+        hashcat --restore --session "$SESSION" --status-timer 1 $OPTIONS
         RET_VALUE="$?"
         START_FROM="$((stepi+1))"
         RESTORE="false"
