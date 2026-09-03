@@ -209,30 +209,38 @@ for card_num in range(1, 6):
         "temperature_c": temp,
     })
 
-# Get power data from rocm-smi
+# Get power and utilization data from rocm-smi
+# (sysfs gpu_busy_percent is unreliable on AMD; rocm-smi is accurate)
 try:
     result = subprocess.run(
-        ["rocm-smi", "--alldevices", "-P"],
+        ["rocm-smi", "--alldevices", "-P", "--showuse"],
         capture_output=True, text=True, timeout=10
     )
     # Parse power lines: "GPU[X] : Average Graphics Package Power (W): YYY.Y"
+    # and utilization lines: "GPU[X] : GPU use (%): YY"
     lines = result.stdout.split('\n')
     gpu_powers = {}
+    gpu_utils = {}
     for line in lines:
-        if 'Average Graphics Package Power' in line:
+        if 'Average Graphics Package Power' in line or 'GPU use (%)' in line:
             parts = line.split(':')
             if len(parts) >= 2:
                 gpu_label = parts[0].strip()  # "GPU[0] "
-                power_str = parts[-1].strip()  # "100.0"
+                value_str = parts[-1].strip()
                 try:
                     gpu_idx = int(gpu_label.replace('GPU[', '').rstrip(']'))
-                    gpu_powers[gpu_idx] = float(power_str)
+                    if 'GPU use (%)' in line:
+                        gpu_utils[gpu_idx] = int(value_str)
+                    else:
+                        gpu_powers[gpu_idx] = float(value_str)
                 except ValueError:
                     pass
 
     for gpu in gpus:
         if gpu["index"] in gpu_powers:
             gpu["power_draw_w"] = gpu_powers[gpu["index"]]
+        if gpu["index"] in gpu_utils:
+            gpu["utilization"] = gpu_utils[gpu["index"]]
 except:
     pass  # rocm-smi may not be available
 
@@ -245,9 +253,8 @@ TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "unknown")
 
 # Output JSON
 python3 - "$IS_RUNNING" "$SESSION_NAME" "$SESSION_PRE" "$STEP_NUM" "$TOTAL_STEPS" "$HASH_COUNT" "$CRACKED_COUNT" "$PROGRESS_PCT" "$WORDLIST_BASE" "$RULE_BASE" "$HASHCAT_PID" "$GPU_DATA" "$TIMESTAMP" <<'PYEOF'
-import json, os, sys
-import time
-from datetime import timedelta
+import json, os, re, subprocess, sys, time
+from datetime import datetime
 
 is_running = sys.argv[1] == "true"
 session_name = sys.argv[2]
@@ -265,40 +272,233 @@ timestamp = sys.argv[13]
 
 gpus = json.loads(gpu_json_str) if gpu_json_str != "[]" else []
 
-# Calculate elapsed time if hashcat is running
-elapsed_seconds = 0
-elapsed_human = "0:00:00"
-remaining_human = "?"
-speed_str = ""
-speed_raw = 0
 
-if is_running and hashcat_pid:
-    # Try to find when hashcat started by checking its /proc
+def fmt_duration(secs):
+    secs = max(0, int(secs))
+    if secs == 0:
+        return "—"
+    d, r = divmod(secs, 86400)
+    h, r = divmod(r, 3600)
+    m, s = divmod(r, 60)
+    if d:
+        return f"{d}d {h}h {m}m"
+    if h:
+        return f"{h}h {m}m {s}s"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
+def parse_hc_datetime(s):
+    """Parse a hashcat absolute datetime like 'Wed Aug 26 14:37:42 2026'."""
+    m = re.match(r"[A-Z][a-z]{2}\s+([A-Z][a-z]{2})\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})\s+(\d{4})", s or "")
+    if not m:
+        return None
+    months = {"Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
+              "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12}
+    mon = months.get(m.group(1))
+    if not mon:
+        return None
     try:
-        starttime = open(f"/proc/{hashcat_pid}/stat").read().split()[21]
-        clk_tck = os.sysconf(os.sysconf_names['SC_CLK_TCK'])
-        # Get system boot time + uptime
-        boot_time = open("/proc/stat").read().split('\n')[0]
-        # Actually, easier: check the session restore file modification time
-        restore_path = f"/home/kesenheimer/.local/share/hashcat/sessions/{session_name}.restore"
-        if os.path.exists(restore_path):
-            mtime = os.path.getmtime(restore_path)
-            elapsed_seconds = int(time.time() - mtime)
-            elapsed_human = str(timedelta(seconds=elapsed_seconds))
-    except:
+        return datetime(int(m.group(6)), mon, int(m.group(2)),
+                        int(m.group(3)), int(m.group(4)), int(m.group(5)))
+    except ValueError:
+        return None
+
+
+def find_screen_session(pid):
+    """Return the PID of the screen session that is an ancestor of pid, if any."""
+    parents = {}
+    for p in os.listdir("/proc"):
+        if not p.isdigit():
+            continue
+        try:
+            with open(f"/proc/{p}/stat") as f:
+                fields = f.read().rsplit(")", 1)[1].split()
+            parents[int(p)] = int(fields[1])
+        except (OSError, IndexError, ValueError):
+            continue
+    try:
+        out = subprocess.run(["screen", "-ls"], capture_output=True, text=True,
+                             timeout=5).stdout
+    except Exception:
+        return None
+    for m in re.finditer(r"^\s*(\d+)\.\S+", out, re.M):
+        spid = int(m.group(1))
+        stack, seen = [spid], set()
+        while stack:
+            cur = stack.pop()
+            if cur == pid:
+                return spid
+            if cur in seen:
+                continue
+            seen.add(cur)
+            for k, v in parents.items():
+                if v == cur:
+                    stack.append(k)
+    return None
+
+
+def has_status_flag(pid):
+    """True if hashcat was started with --status (periodic blocks on its own)."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return b"--status" in f.read()
+    except OSError:
+        return False
+
+
+def _dbg(*args):
+    if os.environ.get("HC_DEBUG"):
+        print("[hc-debug]", *args, file=sys.stderr)
+
+
+def hardcopy_and_parse(screen_pid):
+    """Dump the screen (scrollback + display) and parse the newest complete
+    status block belonging to our session. Returns None if there is none.
+
+    A fully rendered block ends with its Hardware.Mon line(s). If hashcat is
+    still writing the newest block, we retry once, then fall back to the
+    previous complete block of our session."""
+    def dump():
+        try:
+            r = subprocess.run(["screen", "-X", "-S", str(screen_pid), "hardcopy", "-h", HC_TMP],
+                               capture_output=True, timeout=3)
+            with open(HC_TMP) as f:
+                text = f.read()
+            _dbg(f"hardcopy: rc={r.returncode} len={len(text)}")
+            return text
+        except Exception as e:
+            _dbg(f"hardcopy exception: {e!r}")
+            return ""
+
+    def starts_of(t):
+        return [m.start() for m in re.finditer(r"^Session\.{5,}: ", t, re.M)]
+
+    def complete(blk):
+        # Hardware.Mon = last data line of a GPU block; Recovered covers
+        # host-only sessions that have no Hardware.Mon lines.
+        return "Hardware.Mon" in blk or "Recovered" in blk
+
+    # 'screen -X hardcopy' can return before the file is fully written,
+    # so retry until the dump looks complete.
+    text = ""
+    for _ in range(3):
+        text = dump()
+        if text and ("[s]tatus" in text or "Session" in text):
+            break
+        time.sleep(0.3)
+    if not text:
+        return None
+
+    starts = starts_of(text)
+    if not starts:
+        _dbg("no Session block found in hardcopy")
+        return None
+    # Newest block still being written by hashcat (no tail line yet):
+    # give it a moment, then dump once more.
+    if not complete(text[starts[-1]:]):
+        time.sleep(0.4)
+        text = dump() or text
+        starts = starts_of(text) or starts
+    if not starts:
+        return None
+
+    # Walk from newest to oldest: first complete block of our session.
+    for i in range(len(starts) - 1, -1, -1):
+        end = starts[i + 1] if i + 1 < len(starts) else len(text)
+        block = text[starts[i]:end]
+        m = re.search(r"^Session\.{5,}: (\S+)", block, re.M)
+        if not m or m.group(1) != session_name:
+            continue
+        if i == len(starts) - 1 and not complete(block):
+            _dbg("newest block incomplete (hashcat mid-write), using previous block")
+            continue
+
+        def grab(pat):
+            mm = re.search(pat, block, re.M)
+            return mm.group(1).strip() if mm else None
+
+        info = {
+            "status": grab(r"^Status\.{2,}: (\S+)"),
+            "time_started": grab(r"^Time\.Started\.{2,}: (.+)"),
+            "time_estimated": grab(r"^Time\.Estimated\.{2,}: (.+)"),
+            "speed": grab(r"^Speed\.#\*\.{2,}: (.+)"),
+        }
+        # Overlay fan speed from the block onto the GPU list (only source for
+        # it; utilization/temperature come from rocm-smi/sysfs, which are
+        # fresher). hashcat device #NN: OpenCL 5-8 -> GPU 0-3, HIP 1-4 -> 0-3
+        for hm in re.finditer(r"^Hardware\.Mon\.#(\d+)\.{1,}: Temp:\s*(\d+)c Fan:\s*(\d+)% Util:\s*(\d+)%",
+                              block, re.M):
+            dev = int(hm.group(1))
+            idx = dev - 5 if dev >= 5 else dev - 1
+            for g in gpus:
+                if g.get("index") == idx:
+                    g["fan_percent"] = int(hm.group(3))
+                    break
+        return info
+    _dbg(f"no complete block for session {session_name!r}")
+    return None
+
+
+# ── Elapsed time: runtime of the current hashcat process (from /proc) ──
+elapsed_seconds = 0
+if is_running and hashcat_pid:
+    try:
+        with open(f"/proc/{hashcat_pid}/stat") as f:
+            fields = f.read().rsplit(")", 1)[1].split()
+        starttime_ticks = int(fields[19])  # field 22 of /proc/PID/stat
+        clk_tck = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
+        with open("/proc/uptime") as f:
+            uptime = float(f.read().split()[0])
+        elapsed_seconds = max(0, int(uptime - starttime_ticks / clk_tck))
+    except (OSError, IndexError, ValueError):
         pass
 
-    # Try to estimate speed from GPU utilization changes
-    # This is a rough heuristic: if GPUs are at ~100% utilization, they're hashing fast
-    active_gpus = [g for g in gpus if g.get("utilization") is not None and g["utilization"] > 50]
-    if active_gpus:
-        avg_util = sum(g["utilization"] for g in active_gpus) / len(active_gpus)
-        if avg_util > 80:
-            speed_str = "active"
-        elif avg_util > 30:
-            speed_str = "reduced"
-        else:
-            speed_str = "idle"
+# ── ETA, speed and GPU telemetry from the newest hashcat status block ──
+HC_TMP = "/tmp/.hc-status-hardcopy"
+try:  # remove hardcopy left behind by a poller killed mid-run
+    os.unlink(HC_TMP)
+except OSError:
+    pass
+
+remaining_human = "—"
+speed_str = ""
+hashcat_status = ""
+if is_running and hashcat_pid:
+    try:
+        screen_pid = find_screen_session(int(hashcat_pid))
+        block = hardcopy_and_parse(screen_pid) if screen_pid else None
+        # Press 's' to force a status block when there is none on screen, and
+        # periodically for sessions started without --status (their blocks go
+        # stale otherwise). Throttled via a timestamp file.
+        if screen_pid and (block is None or not has_status_flag(int(hashcat_pid))):
+            ts_path = "/tmp/.hc-status-stuff-ts"
+            try:
+                with open(ts_path) as f:
+                    last_stuff = float(f.read().strip() or 0)
+            except (OSError, ValueError):
+                last_stuff = 0.0
+            now = time.time()
+            interval = 10 if block is None else 300
+            if now - last_stuff > interval:
+                with open(ts_path, "w") as f:
+                    f.write(str(now))
+                subprocess.run(["screen", "-X", "-S", str(screen_pid),
+                                "stuff", "s"], capture_output=True, timeout=5)
+                time.sleep(1.5)
+                block = hardcopy_and_parse(screen_pid)
+    except Exception as e:
+        _dbg(f"eta section exception: {e!r}")
+        block = None
+
+    if block:
+        hashcat_status = block.get("status") or ""
+        speed_str = block.get("speed") or ""
+        est_dt = parse_hc_datetime(block.get("time_estimated"))
+        if est_dt:
+            remaining = int((est_dt - datetime.now()).total_seconds())
+            remaining_human = fmt_duration(remaining) if remaining > 0 else "0s"
 
 result = {
     "session": session_name,
@@ -313,9 +513,10 @@ result = {
     "cracked_count": cracked_count,
     "progress_percent": progress_pct,
     "elapsed_seconds": elapsed_seconds,
-    "elapsed_human": elapsed_human,
+    "elapsed_human": fmt_duration(elapsed_seconds) if elapsed_seconds else "—",
     "remaining_human": remaining_human,
     "speed": speed_str,
+    "hashcat_status": hashcat_status,
     "gpus": gpus,
     "timestamp": timestamp
 }

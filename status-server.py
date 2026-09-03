@@ -3,7 +3,8 @@
 status-server.py — Lightweight HTTP server for hashcat cracking status.
 
 Zero external dependencies — uses Python's built-in http.server and subprocess.
-Polls poll-status.sh every 2 seconds and serves the result via HTTP.
+Polls poll-status.sh every 2 seconds and tracks recent/cracked.txt,
+serving both via HTTP.
 
 Usage:
     python3 status-server.py              # default: port 8080, no auth
@@ -16,32 +17,42 @@ Access:
     http://localhost:8080/api/history    # JSON history (last 300 snapshots)
     http://localhost:8080/api/sessions   # List known sessions
     http://localhost:8080/api/gpu        # GPU metrics only
+    http://localhost:8080/api/cracked    # Cracked passwords (recent/cracked.txt)
 """
 
 import http.server
 import json
 import os
+import re
 import socket
 import signal
 import subprocess
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from html import escape
 from urllib.parse import urlparse, parse_qs
 
 # ── Configuration ──────────────────────────────────────────────────────────
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 POLL_SCRIPT = os.path.join(SCRIPT_DIR, "poll-status.sh")
+CRACKED_FILE = os.path.join(SCRIPT_DIR, "recent", "cracked.txt")
 HISTORY_MAX = 300  # Keep last N snapshots
 POLL_INTERVAL = 2  # Seconds between polls
 DEFAULT_PORT = 8080
+
+# Matches hashcat's $HEX[abcdef...] password encoding
+HEX_RE = re.compile(r"^\$HEX\[([0-9a-fA-F]+)\]$")
 
 # ── Globals ────────────────────────────────────────────────────────────────
 history = []       # Last N snapshots (list of dicts)
 last_status = {}   # Most recent snapshot
 status_lock = threading.Lock()
+last_cracked = []  # Parsed recent/cracked.txt entries (list of dicts)
+cracked_meta = {"count": 0, "file": None}
+cracked_lock = threading.Lock()
+cracked_cache_key = None  # (realpath, mtime) of last parsed file
 running = True
 
 # ── CLI parsing ────────────────────────────────────────────────────────────
@@ -61,6 +72,64 @@ def parse_args():
             i += 1
     return port, auth_token
 
+# ── Cracked password tracking ──────────────────────────────────────────────
+def decode_pw(raw):
+    """Decode a hashcat password field.
+
+    $HEX[abcdef...] is decoded to its byte string (trailing null padding
+    stripped). Plain strings are returned unchanged.
+    """
+    m = HEX_RE.match(raw)
+    if m:
+        try:
+            return bytes.fromhex(m.group(1)).rstrip(b"\x00").decode("utf-8", "replace")
+        except ValueError:
+            return raw
+    return raw
+
+def refresh_cracked():
+    """Re-parse recent/cracked.txt if it changed (or the symlink re-pointed)."""
+    global last_cracked, cracked_meta, cracked_cache_key
+    try:
+        real = os.path.realpath(CRACKED_FILE)
+        st = os.stat(real)
+    except OSError:
+        with cracked_lock:
+            last_cracked = []
+            cracked_meta = {"count": 0, "file": None}
+        cracked_cache_key = None
+        return
+
+    key = (real, st.st_mtime)
+    if key == cracked_cache_key:
+        return  # unchanged since last parse
+
+    entries = []
+    try:
+        with open(real) as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if not line.strip():
+                    continue
+                # hash:essid:ap_mac:ssid:password  (password keeps any ':' inside)
+                parts = line.split(":", 4)
+                raw_pw = parts[4] if len(parts) >= 5 else ""
+                entries.append({
+                    "hash": parts[0] if len(parts) > 0 else "",
+                    "essid": parts[1] if len(parts) > 1 else "",
+                    "ap_mac": parts[2] if len(parts) > 2 else "",
+                    "ssid": parts[3] if len(parts) > 3 else "",
+                    "password": decode_pw(raw_pw),
+                    "raw_password": raw_pw,
+                })
+    except OSError:
+        pass
+
+    with cracked_lock:
+        last_cracked = entries
+        cracked_meta = {"count": len(entries), "file": real}
+    cracked_cache_key = key
+
 # ── Polling loop ───────────────────────────────────────────────────────────
 def poll():
     """Run poll-status.sh and update the shared state."""
@@ -74,7 +143,7 @@ def poll():
             )
             if result.returncode == 0 and result.stdout.strip():
                 data = json.loads(result.stdout.strip())
-                data["_poll_time"] = datetime.now(tz=None).isoformat() + "Z"
+                data["_poll_time"] = datetime.now(timezone.utc).isoformat()
                 with status_lock:
                     last_status = data
                     history.append(data)
@@ -82,6 +151,7 @@ def poll():
                         history = history[-HISTORY_MAX:]
         except Exception:
             pass  # Silently fail on poll error
+        refresh_cracked()  # Keep cracked.txt data fresh (mtime-cached)
         time.sleep(POLL_INTERVAL)
 
 # ── HTTP Handler ───────────────────────────────────────────────────────────
@@ -123,6 +193,14 @@ class StatusHandler(http.server.BaseHTTPRequestHandler):
                     "session": last_status.get("session"),
                     "status": last_status.get("status"),
                     "gpus": gpu_data
+                })
+
+        elif path == "/api/cracked":
+            with cracked_lock:
+                self.send_json({
+                    "cracked": last_cracked,
+                    "count": len(last_cracked),
+                    "file": cracked_meta.get("file"),
                 })
 
         elif path == "/api/sessions":
@@ -227,6 +305,18 @@ header h1 { font-size: 18px; font-weight: 600; color: #f0f6fc; }
 .speed-indicator.idle { background: #21262d; color: var(--dim); }
 .speed-indicator.off { background: #21262d; color: var(--dim); }
 
+/* Cracked passwords */
+.cracked-section { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-bottom: 20px; }
+.cracked-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+.cracked-title { color: var(--dim); font-size: 11px; text-transform: uppercase; }
+.cracked-count { background: #238636; color: #fff; padding: 2px 10px; border-radius: 10px; font-size: 12px; font-weight: 700; }
+.cracked-list { display: flex; flex-direction: column; gap: 6px; max-height: 420px; overflow-y: auto; }
+.cracked-empty { color: var(--dim); font-size: 12px; padding: 8px 0; }
+.cracked-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; gap: 12px; background: #21262d; border-radius: 6px; padding: 8px 12px; align-items: center; }
+.cracked-ssid { font-weight: 600; color: #f0f6fc; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cracked-pw { color: var(--green); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cracked-mac { color: var(--dim); font-size: 11px; white-space: nowrap; }
+
 /* Footer */
 footer { padding: 16px 24px; border-top: 1px solid var(--border); color: var(--dim); font-size: 11px; text-align: center; }
 
@@ -234,6 +324,8 @@ footer { padding: 16px 24px; border-top: 1px solid var(--border); color: var(--d
 @media (max-width: 600px) {
   .gpu-grid { grid-template-columns: 1fr; }
   .session-info { flex-direction: column; align-items: flex-start; gap: 4px; }
+  .cracked-row { grid-template-columns: 1fr; gap: 2px; }
+  .cracked-mac { order: 3; }
 }
 
 /* Pulse animation for running status */
@@ -301,6 +393,17 @@ footer { padding: 16px 24px; border-top: 1px solid var(--border); color: var(--d
     </div>
   </div>
 
+  <!-- Cracked passwords -->
+  <div class="cracked-section">
+    <div class="cracked-header">
+      <span class="cracked-title">Cracked Passwords</span>
+      <span class="cracked-count" id="cracked-count">0</span>
+    </div>
+    <div class="cracked-list" id="cracked-list">
+      <div class="cracked-empty">Loading…</div>
+    </div>
+  </div>
+
   <!-- GPU cards -->
   <div class="gpu-grid" id="gpu-grid">
     <!-- GPU cards injected by JS -->
@@ -314,6 +417,18 @@ footer { padding: 16px 24px; border-top: 1px solid var(--border); color: var(--d
 <script>
 const POLL_INTERVAL = 2000;
 let prevCracked = 0;
+
+function fmtDur(secs) {
+  secs = Math.max(0, Math.floor(secs));
+  const d = Math.floor(secs / 86400);
+  const h = Math.floor((secs % 86400) / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  const s = secs % 60;
+  if (d) return `${d}d ${h}h ${m}m`;
+  if (h) return `${h}h ${m}m ${s}s`;
+  if (m) return `${m}m ${s}s`;
+  return `${s}s`;
+}
 
 function updateUI(data) {
   // Status badge
@@ -331,14 +446,22 @@ function updateUI(data) {
   document.getElementById('session-wordlist').textContent = data.wordlist || '—';
   document.getElementById('session-rule').textContent = data.rule || '—';
 
-  // Speed
+  // Speed (real hashcat throughput, e.g. "378.7 kH/s")
   const speedEl = document.getElementById('session-speed');
   const speed = data.speed || '';
-  speedEl.className = `speed-indicator ${speed || 'off'}`;
-  speedEl.textContent = speed ? speed.charAt(0).toUpperCase() + speed.slice(1) : '—';
+  speedEl.className = `speed-indicator ${speed ? 'active' : 'off'}`;
+  speedEl.textContent = speed || '—';
 
-  // Time
-  document.getElementById('session-elapsed').textContent = data.elapsed_human || '—';
+  // Time — elapsed ticks live between server polls while running
+  let elapsedText;
+  if (data.status === 'running' && (data.elapsed_seconds || 0) > 0) {
+    const pollMs = data._poll_time ? new Date(data._poll_time).getTime() : NaN;
+    const extra = isNaN(pollMs) ? 0 : Math.max(0, (Date.now() - pollMs) / 1000);
+    elapsedText = fmtDur((data.elapsed_seconds || 0) + extra);
+  } else {
+    elapsedText = data.elapsed_human || '—';
+  }
+  document.getElementById('session-elapsed').textContent = elapsedText;
   document.getElementById('session-eta').textContent = data.remaining_human || '—';
 
   // Progress
@@ -382,7 +505,7 @@ function updateUI(data) {
           </div>
           <div class="gpu-metric">
             <div class="metric-label">Fan</div>
-            <div class="metric-value normal">${gpu.fan_rpm || gpu.utilization || 0}%</div>
+            <div class="metric-value normal">${gpu.fan_percent != null ? gpu.fan_percent + '%' : '—'}</div>
           </div>
         </div>
         <div class="gpu-util-bar">
@@ -396,12 +519,45 @@ function updateUI(data) {
   document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
 }
 
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, ch => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[ch]));
+}
+
+function renderCracked(data) {
+  document.getElementById('cracked-count').textContent = data.count || 0;
+  const list = document.getElementById('cracked-list');
+  const items = data.cracked || [];
+  if (!items.length) {
+    list.innerHTML = '<div class="cracked-empty">No passwords cracked yet</div>';
+    return;
+  }
+  let html = '';
+  for (const c of items) {
+    html += `
+      <div class="cracked-row" title="${escapeHtml(c.raw_password)}">
+        <span class="cracked-ssid">${escapeHtml(c.ssid || '—')}</span>
+        <span class="cracked-pw">${escapeHtml(c.password || '—')}</span>
+        <span class="cracked-mac">${escapeHtml(c.ap_mac || '')}</span>
+      </div>`;
+  }
+  list.innerHTML = html;
+}
+
 async function poll() {
   try {
-    const res = await fetch('/api/status');
-    if (res.ok) {
-      const data = await res.json();
+    const [statusRes, crackedRes] = await Promise.all([
+      fetch('/api/status'),
+      fetch('/api/cracked'),
+    ]);
+    if (statusRes.ok) {
+      const data = await statusRes.json();
       updateUI(data);
+    }
+    if (crackedRes.ok) {
+      const cdata = await crackedRes.json();
+      renderCracked(cdata);
     }
   } catch(e) {
     // Silently fail — will retry
@@ -431,6 +587,7 @@ def main():
     print(f"🌐 Crack Monitor → http://localhost:{port}/")
     print(f"   API:    http://localhost:{port}/api/status")
     print(f"   History: http://localhost:{port}/api/history")
+    print(f"   Cracked: http://localhost:{port}/api/cracked")
 
     def shutdown(signum, frame):
         global running

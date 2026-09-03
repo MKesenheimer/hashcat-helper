@@ -5,7 +5,7 @@ function usage() {
     echo "$0 [options, ...]"
     echo "-s|--session      session name prefix."
     echo "-r|--restore      restore last session."
-    echo "-t|--type         WPA hash type (PMK or PBKDF2 (default))."
+    echo "-t|--type         hash type (default 22000)."
     echo "-f|--start-from   start from step x."
     echo "-d|--devices      devices to use (comma separated list)"
     echo "-o|--options      additional options for hashcat"
@@ -30,7 +30,7 @@ CONFIG_FILE="crack.conf"
 START_FROM="1"
 RESTORE="false"
 DEVICES=1
-TYPE="PBKDF2"
+HASH_ID="22000"
 while [[ $# -gt 0 ]]; do
   key="$1"
   case $key in
@@ -48,7 +48,7 @@ while [[ $# -gt 0 ]]; do
     shift
     ;;
     -t|--type)
-    TYPE="$2"
+    HASH_ID="$2"
     shift
     shift
     ;;
@@ -87,11 +87,6 @@ if [[ "$RESTORE" == "true" ]]; then
   fi
 fi
 
-HASH_ID=22000
-if [[ "$TYPE" == "PMK" ]]; then
-  HASH_ID=22001
-fi
-
 # RET_VALUE:
 # 3 -> checkpoint abort
 # 2 -> manual quit
@@ -103,7 +98,7 @@ cat ~/.local/share/hashcat/hashcat.potfile | cut -d ':' -f2 | sort | uniq > ~/wo
 
 # Read config line by line
 current_step=""
-declare -A wordlist rule
+declare -A wordlist rule type hashfile
 step_order=()
 
 while IFS= read -r line || [ -n "$line" ]; do
@@ -120,9 +115,14 @@ while IFS= read -r line || [ -n "$line" ]; do
         wordlist["$current_step"]="${BASH_REMATCH[1]}"
     elif [[ "$line" =~ ^rule=(.*) ]]; then
         rule["$current_step"]="${BASH_REMATCH[1]}"
+    elif [[ "$line" =~ ^type=(.*) ]]; then
+        type["$current_step"]="${BASH_REMATCH[1]}"
+    elif [[ "$line" =~ ^file=(.*) ]]; then
+        hashfile["$current_step"]="${BASH_REMATCH[1]}"
     fi
 done < "$CONFIG_FILE"
 
+WPA_RESULTS="false"
 for step in "${step_order[@]}"; do
     echo "== Running $step =="
     wordlist_base=""
@@ -130,10 +130,23 @@ for step in "${step_order[@]}"; do
 
     wordlist="${wordlist[$step]}"
     rule="${rule[$step]}"
+    step_type="${type[$step]}"
+    step_hashfile="${hashfile[$step]}"
     stepi=$(echo "$step" | grep -o '[0-9]\+')
+
+    # fall back to defaults when not given in the config
+    [ -z "$step_type" ] && step_type="$HASH_ID"
+    [ -z "$step_hashfile" ] && step_hashfile="hashes.hc22000"
+
+    # only WPA results go into cracked-sorted.txt
+    if [[ "$step_type" == "22000" || "$step_type" == "22001" ]]; then
+        WPA_RESULTS="true"
+    fi
 
     echo "wordlist = $wordlist"
     echo "rule = $rule"
+    echo "type = $step_type"
+    echo "file = $step_hashfile"
 
     if [ -n "$wordlist" ]; then
         wordlist_base="$(basename ${wordlist})"
@@ -147,11 +160,11 @@ for step in "${step_order[@]}"; do
     SESSION="$SESSION_PRE-step$stepi-$wordlist_base$rule_base"
     if [[ "$RESTORE" == "false" ]] && [[ "$START_FROM" == "$stepi" ]]; then
         echo "$SESSION" > session.log
-        hashcat -m $HASH_ID -a 0 -o cracked.txt $rule hashes.hc22000 $wordlist --session "$SESSION" -S -d $DEVICES --status-timer 1 $OPTIONS
+        hashcat -m $step_type -a 0 -o cracked.txt $rule $step_hashfile $wordlist --session "$SESSION" -S -d $DEVICES --status --status-timer 1 $OPTIONS
         RET_VALUE="$?"
         START_FROM="$((stepi+1))"
     elif [[ "$LAST_SESSION" == "$SESSION" ]]; then
-        hashcat --restore --session "$SESSION" --status-timer 1 $OPTIONS
+        hashcat --restore --session "$SESSION" --status --status-timer 1 $OPTIONS
         RET_VALUE="$?"
         START_FROM="$((stepi+1))"
         RESTORE="false"
@@ -168,7 +181,7 @@ for step in "${step_order[@]}"; do
 done
 
 ## process and store the results
-if [ -f "cracked.txt" ]; then
+if [ -f "cracked.txt" ] && [[ "$WPA_RESULTS" == "true" ]]; then
   cat cracked.txt | cut -d ':' -f4,5 | sort | uniq >> ../cracked-sorted.txt
-  cat ../cracked-sorted.txt | sort | uniq > ../cracked-sorted.txt
+  sort -u -o ../cracked-sorted.txt ../cracked-sorted.txt
 fi
