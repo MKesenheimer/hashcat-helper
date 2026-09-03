@@ -6,6 +6,7 @@ function usage() {
     echo "-s|--session      session name prefix."
     echo "-r|--restore      restore last session."
     echo "-t|--type         hash type (default 22000)."
+    echo "-c|--config       config file to use (default crack.conf)."
     echo "-f|--start-from   start from step x."
     echo "-d|--devices      devices to use (comma separated list)"
     echo "-o|--options      additional options for hashcat"
@@ -49,6 +50,11 @@ while [[ $# -gt 0 ]]; do
     ;;
     -t|--type)
     HASH_ID="$2"
+    shift
+    shift
+    ;;
+    -c|--config)
+    CONFIG_FILE="$2"
     shift
     shift
     ;;
