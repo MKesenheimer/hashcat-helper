@@ -166,6 +166,7 @@ for step in "${step_order[@]}"; do
     SESSION="$SESSION_PRE-step$stepi-$wordlist_base$rule_base"
     if [[ "$RESTORE" == "false" ]] && [[ "$START_FROM" == "$stepi" ]]; then
         echo "$SESSION" > session.log
+        echo "hashcat -m $step_type -a 0 -o cracked.txt $rule $step_hashfile $wordlist --session \"$SESSION\" -S -d $DEVICES --status --status-timer 1 $OPTIONS"
         hashcat -m $step_type -a 0 -o cracked.txt $rule $step_hashfile $wordlist --session "$SESSION" -S -d $DEVICES --status --status-timer 1 $OPTIONS
         RET_VALUE="$?"
         START_FROM="$((stepi+1))"
